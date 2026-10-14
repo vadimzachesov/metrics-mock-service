@@ -7,3 +7,8 @@ env/
 venv/
 *.mp4
 .idea/
+
+# Kubernetes Secrets (never commit real credentials to Git)
+*-secret.yaml
+*secret.yaml
+!*-secret.example.yaml
