@@ -1,0 +1,56 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: victoria-metrics
+  namespace: monitoring
+  labels:
+    app: victoria-metrics
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: victoria-metrics
+  template:
+    metadata:
+      labels:
+        app: victoria-metrics
+    spec:
+      containers:
+        - name: victoria-metrics
+          image: victoriametrics/victoria-metrics:v1.101.0
+          args:
+            - "-storageDataPath=/vmagent-data"
+            - "-retentionPeriod=14d"
+            - "-httpListenAddr=:8428"
+          ports:
+            - containerPort: 8428
+              name: http
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "1000m"
+              memory: "512Mi"
+          volumeMounts:
+            - name: data
+              mountPath: /vmagent-data
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: victoria-metrics
+  namespace: monitoring
+  labels:
+    app: victoria-metrics
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8428
+      targetPort: 8428
+      name: http
+  selector:
+    app: victoria-metrics
