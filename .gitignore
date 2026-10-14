@@ -1,10 +1,9 @@
-# Python-generated files
 __pycache__/
-*.py[oc]
-build/
-dist/
-wheels/
-*.egg-info
-
-# Virtual environments
-.venv
+*.py[cod]
+*$py.class
+*.env
+.venv/
+env/
+venv/
+*.mp4
+.idea/

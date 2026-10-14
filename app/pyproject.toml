@@ -1,0 +1,12 @@
+[project]
+name = "mock-service"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.110.0",
+    "prometheus-client>=0.20.0",
+    "pydantic>=2.6.0",
+    "pydantic-settings>=2.2.0",
+    "uvicorn[standard]>=0.28.0",
+]
