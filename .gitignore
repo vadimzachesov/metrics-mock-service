@@ -12,3 +12,8 @@ venv/
 *-secret.yaml
 *secret.yaml
 !*-secret.example.yaml
+
+# Local development / scratch sandbox (never committed to Git)
+dev/
+tmp/
+
