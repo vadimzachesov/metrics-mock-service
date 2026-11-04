@@ -52,4 +52,4 @@ echo -e "\n\033[32m=== 5. Проверка статуса подов ===\033[0m"
 kubectl get pods -n monitoring
 
 echo -e "\n\033[32mГотово! Все сервисы мониторинга запущены.\033[0m"
-echo -e "\033[33mGrafana доступна по адресу: http://localhost:30080\033[0m"
+echo -e "\033[33mGrafana доступна по адресу: http://localhost:30080 (логин: admin / пароль: admin)\033[0m"

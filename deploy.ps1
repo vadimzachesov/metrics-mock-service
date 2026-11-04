@@ -1,4 +1,4 @@
-﻿# PowerShell скрипт для быстрого развертывания тестового стенда в Kubernetes (Minikube / Docker Desktop)
+# PowerShell скрипт для быстрого развертывания тестового стенда в Kubernetes (Minikube / Docker Desktop)
 
 Write-Host "=== 1. Проверка и сборка Docker-образа Mock-сервиса ===" -ForegroundColor Cyan
 Push-Location "$PSScriptRoot\app"
@@ -20,9 +20,10 @@ if (Get-Command helm -ErrorAction SilentlyContinue) {
     helm upgrade --install ksm prometheus-community/kube-state-metrics `
       --namespace monitoring
 
-    # Установка Node-Exporter
+    # Установка Node-Exporter (с флагом hostRootFsMount.enabled=false для совместимости с Docker Desktop/WSL2)
     helm upgrade --install node-exporter prometheus-community/prometheus-node-exporter `
-      --namespace monitoring
+      --namespace monitoring `
+      --set hostRootFsMount.enabled=false
 } else {
     Write-Warning "Утилита 'helm' не найдена в PATH. Шаг установки ksm и node-exporter пропущен."
     Write-Host "Для их установки выполните: winget install Helm.Helm (или scoop install helm), затем перезапустите скрипт." -ForegroundColor Yellow
@@ -42,4 +43,4 @@ kubectl apply -f "$PSScriptRoot\manifests\05-mock-app.yaml"
 
 Write-Host "`n=== 5. Проверка статуса подов ===" -ForegroundColor Green
 kubectl get pods -n monitoring
-Write-Host "`nГотово! Grafana доступна в браузере: http://localhost:30080" -ForegroundColor Yellow
+Write-Host "`nГотово! Grafana доступна в браузере: http://localhost:30080 (логин: admin / пароль: admin)" -ForegroundColor Yellow
