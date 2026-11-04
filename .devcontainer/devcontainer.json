@@ -1,0 +1,39 @@
+{
+  "name": "Incident Prediction & K8s Telemetry Lab",
+  "image": "mcr.microsoft.com/devcontainers/python:3.11-bookworm",
+  "features": {
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {
+      "enableDockerBuildx": true
+    },
+    "ghcr.io/devcontainers/features/kubectl-helm-minikube:1": {
+      "version": "latest",
+      "helm": "latest",
+      "minikube": "none"
+    }
+  },
+  "forwardPorts": [30080, 8000, 8428],
+  "portsAttributes": {
+    "30080": {
+      "label": "Grafana Dashboard",
+      "onAutoForward": "notify"
+    },
+    "8000": {
+      "label": "Mock Service (Swagger Docs)",
+      "onAutoForward": "silent"
+    },
+    "8428": {
+      "label": "VictoriaMetrics TSDB",
+      "onAutoForward": "silent"
+    }
+  },
+  "postCreateCommand": "bash .devcontainer/setup-cluster.sh",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-azuretools.vscode-docker",
+        "ms-kubernetes-tools.vscode-kubernetes-tools"
+      ]
+    }
+  }
+}
