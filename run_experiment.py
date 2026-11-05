@@ -38,12 +38,34 @@ def log(msg: str):
     print(f"\033[36m[{datetime.now().strftime('%H:%M:%S')}]\033[0m {msg}", flush=True)
 
 
-def check_health(retries: int = 15, delay: float = 2.0) -> bool:
+def is_port_open(port: int) -> bool:
+    """Checks whether a local port is open and accepting TCP connections."""
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.5)
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
+def start_port_forward(service: str, port: int) -> subprocess.Popen | None:
+    """Launches kubectl port-forward in background if the port is not already bound."""
+    if is_port_open(port):
+        log(f"Port {port} is already open and responding.")
+        return None
+    log(f"Starting auto port-forward: kubectl port-forward svc/{service} {port}:{port} -n monitoring...")
+    proc = subprocess.Popen(
+        ["kubectl", "port-forward", f"svc/{service}", f"{port}:{port}", "-n", "monitoring"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return proc
+
+
+def check_health(retries: int = 15, delay: float = 1.5) -> bool:
     """Verifies that mock-service and VictoriaMetrics are up and responding."""
     for i in range(retries):
         try:
-            r1 = requests.get(f"{MOCK_API_URL}/healthz", timeout=3)
-            r2 = requests.get(f"{VM_QUERY_URL}?query=up", timeout=3)
+            r1 = requests.get(f"{MOCK_API_URL}/healthz", timeout=2)
+            r2 = requests.get(f"{VM_QUERY_URL}?query=up", timeout=2)
             if r1.status_code == 200 and r2.status_code == 200:
                 return True
         except Exception:
@@ -169,40 +191,44 @@ def run_experiment(duration_minutes: int, output_csv: Path):
     log(f"STARTING AUTOMATED TELEMETRY COLLECTION ({duration_minutes} min)")
     log("=" * 65)
 
-    if not check_health(retries=5):
-        log("Services not ready. Running ./start.sh...")
-        subprocess.run(["bash", str(SCRIPT_DIR / "start.sh")], check=False)
-        if not check_health(retries=15):
-            log("\033[31mFailed to connect to mock-service and VictoriaMetrics. Aborting.\033[0m")
-            return
-
-    log("Cluster services are healthy and scraping metrics.")
-    start_time_s = time.time()
-    
-    # Calculate timeline:
-    # 0.0 - 0.35 * duration: Baseline normal traffic
-    # 0.35 - 0.50 * duration: Incident 1 (Latency degradation)
-    # 0.50 - 0.60 * duration: Recovery
-    # 0.60 - 0.75 * duration: Incident 2 (Cascading 5xx errors)
-    # 0.75 - 0.85 * duration: Recovery
-    # 0.85 - 0.95 * duration: Incident 3 (Queue buildup)
-    # 0.95 - 1.00 * duration: Final recovery
-    dur_s = duration_minutes * 60.0
-    t_inc1_start = start_time_s + 0.35 * dur_s
-    t_inc1_end = start_time_s + 0.50 * dur_s
-    t_inc2_start = start_time_s + 0.60 * dur_s
-    t_inc2_end = start_time_s + 0.75 * dur_s
-    t_inc3_start = start_time_s + 0.82 * dur_s
-    t_inc3_end = start_time_s + 0.94 * dur_s
-    t_finish = start_time_s + dur_s
-
-    log(f"Phase 1: Baseline normal traffic until {(t_inc1_start - start_time_s)/60:.1f}m...")
-    
-    inc1_active = False
-    inc2_active = False
-    inc3_active = False
+    pf_mock = None
+    pf_vm = None
 
     try:
+        # 1. Проверяем / возобновляем поды кластера
+        log("Checking pod status in monitoring namespace...")
+        subprocess.run(["bash", str(SCRIPT_DIR / "start.sh")], check=False)
+
+        # 2. Автоматический проброс портов из k8s на localhost (8000 и 8428)
+        pf_mock = start_port_forward("mock-service", 8000)
+        pf_vm = start_port_forward("victoria-metrics", 8428)
+
+        # Даем секунду на установление соединения
+        time.sleep(2)
+
+        if not check_health(retries=15):
+            log("\033[31mFailed to connect to mock-service and VictoriaMetrics even after port-forward. Aborting.\033[0m")
+            return
+
+        log("Cluster services are healthy and scraping metrics.")
+        start_time_s = time.time()
+        
+        # Calculate timeline:
+        dur_s = duration_minutes * 60.0
+        t_inc1_start = start_time_s + 0.35 * dur_s
+        t_inc1_end = start_time_s + 0.50 * dur_s
+        t_inc2_start = start_time_s + 0.60 * dur_s
+        t_inc2_end = start_time_s + 0.75 * dur_s
+        t_inc3_start = start_time_s + 0.82 * dur_s
+        t_inc3_end = start_time_s + 0.94 * dur_s
+        t_finish = start_time_s + dur_s
+
+        log(f"Phase 1: Baseline normal traffic until {(t_inc1_start - start_time_s)/60:.1f}m...")
+        
+        inc1_active = False
+        inc2_active = False
+        inc3_active = False
+
         while time.time() < t_finish:
             now = time.time()
             # Incident 1 trigger
@@ -250,6 +276,11 @@ def run_experiment(duration_minutes: int, output_csv: Path):
         log(f"Anomaly rate: {df['is_anomaly'].mean():.2%}")
 
     finally:
+        # Terminate port forwards
+        if pf_mock:
+            pf_mock.terminate()
+        if pf_vm:
+            pf_vm.terminate()
         # Scale down cluster to 0 replicas to prevent credit burn!
         stop_cluster()
         log("\033[32mCluster successfully scaled to 0. Codespaces will sleep automatically after 5 min.\033[0m")
