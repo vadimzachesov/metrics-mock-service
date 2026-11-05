@@ -84,10 +84,18 @@ def wait_for_deployments():
             log(f"Deployment {dep} is 1/1 Ready.")
 
 
-def check_health(retries: int = 25, delay: float = 1.0) -> bool:
-    """Verifies that mock-service and VictoriaMetrics are up and responding."""
+def check_health(pf_holders: dict, retries: int = 30, delay: float = 1.0) -> bool:
+    """Verifies that mock-service and VictoriaMetrics are up and responding, auto-healing dropped tunnels."""
     last_err = ""
     for i in range(retries):
+        # Если туннель упал из-за раннего ресета сокета или перезапуска пода, перезапускаем
+        if pf_holders.get("mock") and pf_holders["mock"].poll() is not None:
+            log("mock-service port-forward died. Auto-healing tunnel...")
+            pf_holders["mock"] = start_port_forward("mock-service", LOCAL_MOCK_PORT, 8000)
+        if pf_holders.get("vm") and pf_holders["vm"].poll() is not None:
+            log("victoria-metrics port-forward died. Auto-healing tunnel...")
+            pf_holders["vm"] = start_port_forward("victoria-metrics", LOCAL_VM_PORT, 8428)
+
         try:
             r1 = requests.get(f"{MOCK_API_URL}/healthz", timeout=2)
             r2 = requests.get(f"{VM_QUERY_URL}?query=up", timeout=2)
@@ -97,11 +105,17 @@ def check_health(retries: int = 25, delay: float = 1.0) -> bool:
         except Exception as e:
             last_err = str(e)
         time.sleep(delay)
+
     log(f"Health check failed after {retries} retries. Last error: {last_err}")
     for svc in ["mock-service", "victoria-metrics"]:
         p = Path(f"/tmp/pf_{svc}.log")
         if p.exists() and p.stat().st_size > 0:
-            log(f"Port-forward log ({svc}): {p.read_text().strip()}")
+            log(f"Port-forward log ({svc}):\n{p.read_text().strip()}")
+        log(f"--- Container logs for {svc} ---")
+        subprocess.run(["kubectl", "logs", f"deployment/{svc}", "-n", "monitoring", "--tail=20"], check=False)
+
+    log("--- Pod statuses in monitoring namespace ---")
+    subprocess.run(["kubectl", "get", "pods", "-n", "monitoring"], check=False)
     return False
 
 
@@ -218,8 +232,7 @@ def run_experiment(duration_minutes: int, output_csv: Path):
     log(f"STARTING AUTOMATED TELEMETRY COLLECTION ({duration_minutes} min)")
     log("=" * 65)
 
-    pf_mock = None
-    pf_vm = None
+    pf_holders = {"mock": None, "vm": None}
 
     try:
         # 1. Запуск подов и ожидание их готовности (rollout)
@@ -227,14 +240,15 @@ def run_experiment(duration_minutes: int, output_csv: Path):
         subprocess.run(["bash", str(SCRIPT_DIR / "start.sh")], check=False)
         wait_for_deployments()
 
+        # Даем 4 секунды на инициализацию сокетов внутри контейнеров
+        log("Allowing 4s for application runtimes to bind internal ports...")
+        time.sleep(4)
+
         # 2. Поднимаем выделенные туннели портов (18000 и 18428), исключая конфликты с Docker
-        pf_mock = start_port_forward("mock-service", LOCAL_MOCK_PORT, 8000)
-        pf_vm = start_port_forward("victoria-metrics", LOCAL_VM_PORT, 8428)
+        pf_holders["mock"] = start_port_forward("mock-service", LOCAL_MOCK_PORT, 8000)
+        pf_holders["vm"] = start_port_forward("victoria-metrics", LOCAL_VM_PORT, 8428)
 
-        # Небольшая пауза на связку сокетов
-        time.sleep(2)
-
-        if not check_health(retries=25, delay=1.0):
+        if not check_health(pf_holders, retries=30, delay=1.0):
             log("\033[31mFailed to connect to mock-service and VictoriaMetrics. Aborting.\033[0m")
             return
 
@@ -305,16 +319,13 @@ def run_experiment(duration_minutes: int, output_csv: Path):
 
     finally:
         # Terminate port forwards
-        if pf_mock:
-            try:
-                pf_mock.terminate()
-            except Exception:
-                pass
-        if pf_vm:
-            try:
-                pf_vm.terminate()
-            except Exception:
-                pass
+        for key in ["mock", "vm"]:
+            proc = pf_holders.get(key)
+            if proc:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
 
         # Scale down cluster to 0 replicas to prevent credit burn!
         stop_cluster()
