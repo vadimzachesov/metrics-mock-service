@@ -42,6 +42,7 @@ Project/
 │   └── 05-mock-app.yaml     # Деплой тестового приложения
 ├── deploy.ps1               # Скрипт автоматического запуска (PowerShell)
 ├── export_dataset.py        # Скрипт потоковой выгрузки датасета в Pandas
+├── DATA_EXPORT_README.md    # Подробный разбор пайплайна данных и схема работы export_dataset.py
 ├── README.md                # Краткая памятка
 └── ProdREADME.md            # Интерактивный учебник: теория, проверки и коммиты
 ```
