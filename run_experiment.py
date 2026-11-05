@@ -3,15 +3,17 @@
 Automated Kubernetes Chaos Experiment & Telemetry Collector.
 
 Lifecycle:
-  1. Verifies/Starts cluster monitoring and mock app.
-  2. Runs baseline healthy traffic (10 min).
-  3. Sequentially executes progressive chaos scenarios:
+  1. Scales up cluster monitoring and mock app via ./start.sh.
+  2. Binds dedicated port-forward tunnels (18000 -> mock-service, 18428 -> victoria-metrics)
+     bypassing any Docker port collisions on 8000/8428.
+  3. Runs baseline healthy traffic (10 min).
+  4. Sequentially executes progressive chaos scenarios:
      - Incident 1: Database Latency Spike & Worker Stalling (ramp-up 20s).
      - Incident 2: Cascading 5xx Error Storm (ramp-up 20s).
      - Incident 3: Synthetic Backlog & Queue Saturation.
-  4. Exports aligned feature matrix from VictoriaMetrics TSDB into CSV format.
-  5. Scales all deployments to 0 replicas (stop.sh) to immediately idle the cluster.
-  6. Exits cleanly -> GitHub Codespaces auto-shuts down after 5 minutes of inactivity.
+  5. Exports aligned feature matrix from VictoriaMetrics TSDB into CSV format.
+  6. Scales all deployments to 0 replicas (stop.sh) to immediately idle the cluster.
+  7. Exits cleanly -> GitHub Codespaces auto-shuts down after 5 minutes of inactivity.
 """
 
 import argparse
@@ -26,9 +28,15 @@ import requests
 import pandas as pd
 import numpy as np
 
-MOCK_API_URL = "http://localhost:8000"
-VM_EXPORT_URL = "http://localhost:8428/api/v1/export"
-VM_QUERY_URL = "http://localhost:8428/api/v1/query"
+# Use dedicated local ports to completely avoid Docker / kind port conflicts on 8000 / 8428
+LOCAL_MOCK_PORT = 18000
+LOCAL_VM_PORT = 18428
+
+MOCK_API_URL = f"http://127.0.0.1:{LOCAL_MOCK_PORT}"
+VM_BASE_URL = f"http://127.0.0.1:{LOCAL_VM_PORT}"
+VM_EXPORT_URL = f"{VM_BASE_URL}/api/v1/export"
+VM_QUERY_URL = f"{VM_BASE_URL}/api/v1/query"
+VM_QUERY_RANGE_URL = f"{VM_BASE_URL}/api/v1/query_range"
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_OUTPUT_CSV = SCRIPT_DIR / "telemetry_codespaces.csv"
@@ -38,39 +46,31 @@ def log(msg: str):
     print(f"\033[36m[{datetime.now().strftime('%H:%M:%S')}]\033[0m {msg}", flush=True)
 
 
-def is_port_open(port: int) -> bool:
-    """Checks whether a local port is open and accepting TCP connections."""
-    import socket
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.settimeout(0.5)
-        return s.connect_ex(("127.0.0.1", port)) == 0
-
-
-def start_port_forward(service: str, port: int) -> subprocess.Popen | None:
-    """Launches kubectl port-forward in background if the port is not already bound."""
-    if is_port_open(port):
-        log(f"Port {port} is already open and responding.")
-        return None
-    log(f"Starting auto port-forward: kubectl port-forward svc/{service} {port}:{port} -n monitoring...")
+def start_port_forward(service: str, local_port: int, remote_port: int) -> subprocess.Popen:
+    """Launches kubectl port-forward in background on a dedicated port."""
+    log(f"Starting port-forward: kubectl port-forward svc/{service} {local_port}:{remote_port} -n monitoring...")
     proc = subprocess.Popen(
-        ["kubectl", "port-forward", f"svc/{service}", f"{port}:{port}", "-n", "monitoring"],
+        ["kubectl", "port-forward", f"svc/{service}", f"{local_port}:{remote_port}", "-n", "monitoring"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
     return proc
 
 
-def check_health(retries: int = 15, delay: float = 1.5) -> bool:
+def check_health(retries: int = 25, delay: float = 1.0) -> bool:
     """Verifies that mock-service and VictoriaMetrics are up and responding."""
+    last_err = ""
     for i in range(retries):
         try:
             r1 = requests.get(f"{MOCK_API_URL}/healthz", timeout=2)
             r2 = requests.get(f"{VM_QUERY_URL}?query=up", timeout=2)
             if r1.status_code == 200 and r2.status_code == 200:
+                log(f"Health check passed! (mock-service HTTP {r1.status_code}, VictoriaMetrics HTTP {r2.status_code})")
                 return True
-        except Exception:
-            pass
+        except Exception as e:
+            last_err = str(e)
         time.sleep(delay)
+    log(f"Health check failed after {retries} retries. Last error: {last_err}")
     return False
 
 
@@ -112,10 +112,8 @@ def collect_metrics_from_vm(start_time_s: float, end_time_s: float) -> pd.DataFr
     log("Querying VictoriaMetrics Prometheus API for aligned feature timeseries...")
     step_s = 5
     timestamps = np.arange(start_time_s, end_time_s, step_s)
-    
-    # QueryPromQL helper:
+
     def query_promql(query: str) -> dict[int, float]:
-        url = f"http://localhost:8428/api/v1/query_range"
         params = {
             "query": query,
             "start": int(start_time_s),
@@ -124,7 +122,7 @@ def collect_metrics_from_vm(start_time_s: float, end_time_s: float) -> pd.DataFr
         }
         res = {}
         try:
-            resp = requests.get(url, params=params, timeout=15)
+            resp = requests.get(VM_QUERY_RANGE_URL, params=params, timeout=15)
             if resp.status_code == 200:
                 data = resp.json()
                 for series in data.get("data", {}).get("result", []):
@@ -158,8 +156,7 @@ def collect_metrics_from_vm(start_time_s: float, end_time_s: float) -> pd.DataFr
     for ts in timestamps:
         ts_int = int(ts)
         dt = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-        
-        # Fallbacks if metrics had momentary gaps
+
         q = q_map.get(ts_int, np.nan)
         r = rps_map.get(ts_int, np.nan)
         lat = lat_map.get(ts_int, np.nan)
@@ -176,7 +173,6 @@ def collect_metrics_from_vm(start_time_s: float, end_time_s: float) -> pd.DataFr
         })
 
     df = pd.DataFrame(rows)
-    # Forward-fill / backward-fill gaps
     df["queue_depth"] = df["queue_depth"].ffill().bfill().fillna(15.0)
     df["rps"] = df["rps"].ffill().bfill().fillna(50.0)
     df["processing_time"] = df["processing_time"].ffill().bfill().fillna(0.045)
@@ -195,25 +191,25 @@ def run_experiment(duration_minutes: int, output_csv: Path):
     pf_vm = None
 
     try:
-        # 1. Проверяем / возобновляем поды кластера
-        log("Checking pod status in monitoring namespace...")
+        # 1. Запуск подов
+        log("Ensuring pods are scaled up in monitoring namespace...")
         subprocess.run(["bash", str(SCRIPT_DIR / "start.sh")], check=False)
 
-        # 2. Автоматический проброс портов из k8s на localhost (8000 и 8428)
-        pf_mock = start_port_forward("mock-service", 8000)
-        pf_vm = start_port_forward("victoria-metrics", 8428)
+        # 2. Поднимаем выделенные туннели портов (18000 и 18428), исключая конфликты с Docker
+        pf_mock = start_port_forward("mock-service", LOCAL_MOCK_PORT, 8000)
+        pf_vm = start_port_forward("victoria-metrics", LOCAL_VM_PORT, 8428)
 
-        # Даем секунду на установление соединения
+        # Небольшая пауза на связку сокетов
         time.sleep(2)
 
-        if not check_health(retries=15):
-            log("\033[31mFailed to connect to mock-service and VictoriaMetrics even after port-forward. Aborting.\033[0m")
+        if not check_health(retries=25, delay=1.0):
+            log("\033[31mFailed to connect to mock-service and VictoriaMetrics. Aborting.\033[0m")
             return
 
         log("Cluster services are healthy and scraping metrics.")
         start_time_s = time.time()
-        
-        # Calculate timeline:
+
+        # Calculate timeline
         dur_s = duration_minutes * 60.0
         t_inc1_start = start_time_s + 0.35 * dur_s
         t_inc1_end = start_time_s + 0.50 * dur_s
@@ -224,7 +220,7 @@ def run_experiment(duration_minutes: int, output_csv: Path):
         t_finish = start_time_s + dur_s
 
         log(f"Phase 1: Baseline normal traffic until {(t_inc1_start - start_time_s)/60:.1f}m...")
-        
+
         inc1_active = False
         inc2_active = False
         inc3_active = False
@@ -278,9 +274,16 @@ def run_experiment(duration_minutes: int, output_csv: Path):
     finally:
         # Terminate port forwards
         if pf_mock:
-            pf_mock.terminate()
+            try:
+                pf_mock.terminate()
+            except Exception:
+                pass
         if pf_vm:
-            pf_vm.terminate()
+            try:
+                pf_vm.terminate()
+            except Exception:
+                pass
+
         # Scale down cluster to 0 replicas to prevent credit burn!
         stop_cluster()
         log("\033[32mCluster successfully scaled to 0. Codespaces will sleep automatically after 5 min.\033[0m")
