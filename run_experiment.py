@@ -49,12 +49,39 @@ def log(msg: str):
 def start_port_forward(service: str, local_port: int, remote_port: int) -> subprocess.Popen:
     """Launches kubectl port-forward in background on a dedicated port."""
     log(f"Starting port-forward: kubectl port-forward svc/{service} {local_port}:{remote_port} -n monitoring...")
+    log_file_path = f"/tmp/pf_{service}.log"
+    err_file = open(log_file_path, "w")
     proc = subprocess.Popen(
-        ["kubectl", "port-forward", f"svc/{service}", f"{local_port}:{remote_port}", "-n", "monitoring"],
+        [
+            "kubectl", "port-forward",
+            f"svc/{service}",
+            f"{local_port}:{remote_port}",
+            "-n", "monitoring",
+            "--address", "127.0.0.1",
+        ],
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stderr=err_file,
     )
+    time.sleep(1.0)
+    if proc.poll() is not None:
+        err_msg = Path(log_file_path).read_text() if Path(log_file_path).exists() else ""
+        log(f"\033[31mPort-forward for {service} exited unexpectedly (code {proc.returncode}): {err_msg.strip()}\033[0m")
     return proc
+
+
+def wait_for_deployments():
+    """Waits until critical deployments are fully rolled out and ready."""
+    log("Waiting for deployments (mock-service, victoria-metrics) to be Ready...")
+    for dep in ["mock-service", "victoria-metrics"]:
+        res = subprocess.run(
+            ["kubectl", "rollout", "status", f"deployment/{dep}", "-n", "monitoring", "--timeout=60s"],
+            capture_output=True,
+            text=True,
+        )
+        if res.returncode != 0:
+            log(f"\033[33mWarning waiting for {dep}: {res.stderr.strip()}\033[0m")
+        else:
+            log(f"Deployment {dep} is 1/1 Ready.")
 
 
 def check_health(retries: int = 25, delay: float = 1.0) -> bool:
@@ -71,6 +98,10 @@ def check_health(retries: int = 25, delay: float = 1.0) -> bool:
             last_err = str(e)
         time.sleep(delay)
     log(f"Health check failed after {retries} retries. Last error: {last_err}")
+    for svc in ["mock-service", "victoria-metrics"]:
+        p = Path(f"/tmp/pf_{svc}.log")
+        if p.exists() and p.stat().st_size > 0:
+            log(f"Port-forward log ({svc}): {p.read_text().strip()}")
     return False
 
 
@@ -191,9 +222,10 @@ def run_experiment(duration_minutes: int, output_csv: Path):
     pf_vm = None
 
     try:
-        # 1. Запуск подов
+        # 1. Запуск подов и ожидание их готовности (rollout)
         log("Ensuring pods are scaled up in monitoring namespace...")
         subprocess.run(["bash", str(SCRIPT_DIR / "start.sh")], check=False)
+        wait_for_deployments()
 
         # 2. Поднимаем выделенные туннели портов (18000 и 18428), исключая конфликты с Docker
         pf_mock = start_port_forward("mock-service", LOCAL_MOCK_PORT, 8000)

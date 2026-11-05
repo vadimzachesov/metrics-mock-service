@@ -4,5 +4,7 @@ echo -e "\033[36m=== Возобновление работы сервисов м
 kubectl scale deployment --all --replicas=1 -n monitoring
 
 echo -e "\n\033[36mОжидаем запуск подов...\033[0m"
+kubectl rollout status deployment/mock-service -n monitoring --timeout=60s
+kubectl rollout status deployment/victoria-metrics -n monitoring --timeout=60s
 kubectl get pods -n monitoring
 echo -e "\n\033[32mГотово! Grafana доступна по адресу: http://localhost:30080\033[0m"
