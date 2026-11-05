@@ -147,84 +147,90 @@ def stop_cluster():
 def collect_metrics_from_vm(start_time_s: float, end_time_s: float) -> pd.DataFrame:
     """
     Queries VictoriaMetrics for the experiment interval and reconstructs
-    the required ML feature columns:
-      - queue_depth (Gauge)
-      - rps (Rate of requests)
-      - processing_time (Mean duration from histogram)
-      - cpu_usage (Container or node CPU)
-      - is_anomaly (Ground truth target)
+    the required ML feature columns using robust time-series alignment.
     """
     log("Querying VictoriaMetrics Prometheus API for aligned feature timeseries...")
     step_s = 5
-    timestamps = np.arange(start_time_s, end_time_s, step_s)
 
-    def query_promql(query: str) -> dict[int, float]:
+    def query_promql_series(query: str, col_name: str) -> pd.DataFrame:
         params = {
             "query": query,
             "start": int(start_time_s),
             "end": int(end_time_s),
             "step": f"{step_s}s",
         }
-        res = {}
         try:
             resp = requests.get(VM_QUERY_RANGE_URL, params=params, timeout=15)
             if resp.status_code == 200:
                 data = resp.json()
+                rows = []
                 for series in data.get("data", {}).get("result", []):
                     for ts, val in series.get("values", []):
-                        ts_key = int(ts)
-                        res[ts_key] = max(res.get(ts_key, 0.0), float(val))
+                        rows.append({"ts_epoch": int(ts), col_name: float(val)})
+                if rows:
+                    df_sub = pd.DataFrame(rows)
+                    # Deduplicate by timestamp, taking maximum value
+                    df_sub = df_sub.groupby("ts_epoch", as_index=False)[col_name].max()
+                    log(f"  -> {col_name}: successfully fetched {len(df_sub)} points")
+                    return df_sub
+            else:
+                log(f"\033[31mVictoriaMetrics returned HTTP {resp.status_code} for '{col_name}'\033[0m")
         except Exception as e:
-            log(f"Query error for '{query}': {e}")
-        return res
+            log(f"\033[31mQuery error for '{col_name}' ({query}): {e}\033[0m")
+        return pd.DataFrame(columns=["ts_epoch", col_name])
 
     log("Fetching queue_depth...")
-    q_map = query_promql("max(mock_app_queue_depth)")
+    df_q = query_promql_series("max(mock_app_queue_depth)", "queue_depth")
 
     log("Fetching rps...")
-    rps_map = query_promql("sum(rate(mock_app_requests_total[30s]))")
+    df_rps = query_promql_series("sum(rate(mock_app_requests_total[30s]))", "rps")
 
     log("Fetching processing_time...")
-    lat_map = query_promql(
-        "sum(rate(mock_app_processing_time_seconds_sum[30s])) / sum(rate(mock_app_processing_time_seconds_count[30s]))"
+    df_lat = query_promql_series(
+        "sum(rate(mock_app_processing_time_seconds_sum[30s])) / sum(rate(mock_app_processing_time_seconds_count[30s]))",
+        "processing_time",
     )
 
     log("Fetching cpu_usage...")
-    cpu_map = query_promql(
-        "sum(rate(container_cpu_usage_seconds_total{container='mock-service'}[30s])) or sum(rate(node_cpu_seconds_total{mode!='idle'}[30s])) / count(node_cpu_seconds_total{mode='idle'})"
+    df_cpu = query_promql_series(
+        "sum(rate(container_cpu_usage_seconds_total{container='mock-service'}[30s])) or sum(rate(node_cpu_seconds_total{mode!='idle'}[30s])) / count(node_cpu_seconds_total{mode='idle'})",
+        "cpu_usage",
     )
 
     log("Fetching anomaly ground truth label...")
-    anom_map = query_promql("max(mock_app_anomaly_mode_active)")
+    df_anom = query_promql_series("max(mock_app_anomaly_mode_active)", "is_anomaly")
 
-    rows = []
-    for ts in timestamps:
-        ts_int = int(ts)
-        dt = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    # Time spine
+    all_ts = np.arange(int(start_time_s), int(end_time_s), step_s)
+    df = pd.DataFrame({"ts_epoch": all_ts})
 
-        q = q_map.get(ts_int, np.nan)
-        r = rps_map.get(ts_int, np.nan)
-        lat = lat_map.get(ts_int, np.nan)
-        cpu = cpu_map.get(ts_int, np.nan)
-        anom = anom_map.get(ts_int, 0.0)
+    # Merge each metric using nearest time alignment (tolerance up to 10s)
+    for sub_df, col in [(df_q, "queue_depth"), (df_rps, "rps"), (df_lat, "processing_time"), (df_cpu, "cpu_usage"), (df_anom, "is_anomaly")]:
+        if not sub_df.empty:
+            df = pd.merge_asof(
+                df.sort_values("ts_epoch"),
+                sub_df.sort_values("ts_epoch"),
+                on="ts_epoch",
+                direction="nearest",
+                tolerance=10,
+            )
+        else:
+            log(f"\033[33mWarning: metric '{col}' returned empty from TSDB!\033[0m")
+            df[col] = np.nan
 
-        rows.append({
-            "timestamp": dt,
-            "queue_depth": q,
-            "rps": r,
-            "processing_time": lat,
-            "cpu_usage": cpu,
-            "is_anomaly": int(anom > 0.5),
-        })
+    # Convert epoch to human readable timestamp
+    df["timestamp"] = pd.to_datetime(df["ts_epoch"], unit="s", utc=True).dt.strftime("%Y-%m-%d %H:%M:%S")
+    df = df.drop(columns=["ts_epoch"])
 
-    df = pd.DataFrame(rows)
-    df["queue_depth"] = df["queue_depth"].ffill().bfill().fillna(15.0)
-    df["rps"] = df["rps"].ffill().bfill().fillna(50.0)
-    df["processing_time"] = df["processing_time"].ffill().bfill().fillna(0.045)
-    df["cpu_usage"] = df["cpu_usage"].ffill().bfill().fillna(0.25)
-    df["is_anomaly"] = df["is_anomaly"].fillna(0).astype(int)
+    # Interpolate forward/backward for missing points
+    df["queue_depth"] = df["queue_depth"].interpolate(method="linear").bfill().ffill()
+    df["rps"] = df["rps"].interpolate(method="linear").bfill().ffill()
+    df["processing_time"] = df["processing_time"].interpolate(method="linear").bfill().ffill()
+    df["cpu_usage"] = df["cpu_usage"].interpolate(method="linear").bfill().ffill()
+    df["is_anomaly"] = df["is_anomaly"].fillna(0).round().astype(int)
 
-    return df
+    cols_order = ["timestamp", "queue_depth", "rps", "processing_time", "cpu_usage", "is_anomaly"]
+    return df[cols_order]
 
 
 def run_experiment(duration_minutes: int, output_csv: Path):
@@ -303,14 +309,36 @@ def run_experiment(duration_minutes: int, output_csv: Path):
                 inject_chaos("queue", enable=False, ramp_seconds=15.0)
                 inc3_active = False
 
+            # Keep tunnels warm and check health periodically
+            if int(now) % 30 < 5:
+                try:
+                    requests.get(f"{VM_QUERY_URL}?query=up", timeout=2)
+                except Exception:
+                    pass
+
             time.sleep(5)
 
         end_time_s = time.time()
-        log("Experiment timeline completed. Collecting final dataset from TSDB...")
+        log("Experiment timeline completed. Re-establishing fresh VictoriaMetrics tunnel...")
 
-        # Small wait for scrapers to ingest last metrics
-        time.sleep(10)
+        # Reconnect VictoriaMetrics tunnel to guarantee a fresh, responsive socket
+        if pf_holders.get("vm"):
+            try:
+                pf_holders["vm"].terminate()
+            except Exception:
+                pass
+        pf_holders["vm"] = start_port_forward("victoria-metrics", LOCAL_VM_PORT, 8428)
+        time.sleep(3)
+
         df = collect_metrics_from_vm(start_time_s, end_time_s)
+
+        # Sanity check: verify extracted telemetry has real dynamics
+        q_unique = df["queue_depth"].nunique()
+        r_unique = df["rps"].nunique()
+        if q_unique <= 1 and r_unique <= 1:
+            log("\033[31m[WARNING] Extracted dataset has static values! Check TSDB queries.\033[0m")
+        else:
+            log(f"\033[32mDataset verified! Queue distinct values: {q_unique}, RPS distinct values: {r_unique}\033[0m")
 
         output_csv.parent.mkdir(parents=True, exist_ok=True)
         df.to_csv(output_csv, index=False)
